@@ -126,6 +126,8 @@ typedef struct
     YORUKV_PersistEraseFunc Erase;
     void *User;
     yorukv_u32_t Size;
+    yorukv_u32_t BlockSize;
+    yorukv_u32_t BlockCount;
     yorukv_u32_t WriteBlockSize;
     yorukv_u8_t ErasedValue;
 } YORUKV_PersistConfigTypeDef;
@@ -137,8 +139,10 @@ typedef struct
     yorukv_u8_t Initialized;
 #if YORUKV_ENABLE_PERSIST
     const YORUKV_PersistConfigTypeDef *Persist;
+    yorukv_u32_t PersistActiveBlock;
     yorukv_u32_t PersistWriteOffset;
     yorukv_u32_t PersistNextSeq;
+    yorukv_u32_t PersistNextBlockSeq;
 #endif
 } YORUKV_HandleTypeDef;
 
@@ -361,6 +365,11 @@ static inline YORUKV_StatusTypeDef yorukv__value_from_item_current_(const YORUKV
 #define YORUKV_PERSIST_HEADER_SIZE 16u
 #define YORUKV_PERSIST_FLAG_VALID   0x0001u
 #define YORUKV_PERSIST_FLAG_DELETED 0x0002u
+#define YORUKV_BLOCK_MAGIC 0x424Bu
+#define YORUKV_BLOCK_HEADER_SIZE 16u
+#define YORUKV_BLOCK_STATE_EMPTY  0u
+#define YORUKV_BLOCK_STATE_ACTIVE 1u
+#define YORUKV_BLOCK_STATE_FULL   2u
 
 static inline yorukv_u32_t yorukv__persist_checksum_(const char *key, yorukv_u32_t key_len, const YORUKV_ValueTypeDef *value, yorukv_u32_t seq, unsigned flags)
 {
@@ -406,6 +415,15 @@ static inline yorukv_u32_t yorukv__persist_checksum_(const char *key, yorukv_u32
     return sum;
 }
 
+static inline yorukv_u32_t yorukv__block_checksum_(unsigned state, yorukv_u32_t seq, yorukv_u32_t erase_count)
+{
+    return 0x59424B31u
+         + (yorukv_u32_t)YORUKV_BLOCK_MAGIC
+         + ((yorukv_u32_t)state << 8)
+         + seq
+         + erase_count;
+}
+
 static inline yorukv_u32_t yorukv__persist_value_len_(const YORUKV_ValueTypeDef *value)
 {
     switch (value->Type) {
@@ -417,7 +435,185 @@ static inline yorukv_u32_t yorukv__persist_value_len_(const YORUKV_ValueTypeDef 
     }
 }
 
-static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value, unsigned flags)
+static inline yorukv_u32_t yorukv__persist_block_size_(const YORUKV_HandleTypeDef *hkv)
+{
+    if (!hkv || !hkv->Persist) return 0u;
+    if (hkv->Persist->BlockCount == 0u) return hkv->Persist->Size;
+    if (hkv->Persist->BlockSize == 0u) return 0u;
+    return hkv->Persist->BlockSize;
+}
+
+static inline yorukv_u32_t yorukv__persist_block_count_(const YORUKV_HandleTypeDef *hkv)
+{
+    if (!hkv || !hkv->Persist) return 0u;
+    return (hkv->Persist->BlockCount == 0u) ? 1u : hkv->Persist->BlockCount;
+}
+
+static inline yorukv_u32_t yorukv__persist_block_offset_(const YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index)
+{
+    return block_index * yorukv__persist_block_size_(hkv);
+}
+
+static inline yorukv_u32_t yorukv__persist_block_header_span_(const YORUKV_HandleTypeDef *hkv)
+{
+    yorukv_u32_t align = 1u;
+
+    if (hkv && hkv->Persist && (hkv->Persist->WriteBlockSize != 0u)) {
+        align = hkv->Persist->WriteBlockSize;
+    }
+
+    return yorukv__align_up_(YORUKV_BLOCK_HEADER_SIZE, align);
+}
+
+static inline yorukv_u32_t yorukv__persist_block_data_begin_(const YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index)
+{
+    return yorukv__persist_block_offset_(hkv, block_index) + yorukv__persist_block_header_span_(hkv);
+}
+
+static inline yorukv_u32_t yorukv__persist_block_data_end_(const YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index)
+{
+    return yorukv__persist_block_offset_(hkv, block_index) + yorukv__persist_block_size_(hkv);
+}
+
+static inline unsigned yorukv__persist_is_erased_header_(const YORUKV_HandleTypeDef *hkv, const yorukv_u8_t *buf)
+{
+    return (unsigned)((buf[0] == hkv->Persist->ErasedValue) &&
+                      (buf[1] == hkv->Persist->ErasedValue) &&
+                      (buf[2] == hkv->Persist->ErasedValue) &&
+                      (buf[3] == hkv->Persist->ErasedValue));
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_read_block_header_(const YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index,
+                                                                      unsigned *state, yorukv_u32_t *seq, yorukv_u32_t *erase_count,
+                                                                      unsigned *is_empty, unsigned *is_valid)
+{
+    yorukv_u8_t buf[YORUKV_BLOCK_HEADER_SIZE];
+
+    if (!hkv || !hkv->Persist) return YORUKV_INVALID_PARAM;
+    if (hkv->Persist->Read(hkv->Persist->User, yorukv__persist_block_offset_(hkv, block_index), buf, YORUKV_BLOCK_HEADER_SIZE) != YORUKV_OK) {
+        return YORUKV_ERROR;
+    }
+
+    if (is_empty) *is_empty = yorukv__persist_is_erased_header_(hkv, buf);
+    if (yorukv__persist_is_erased_header_(hkv, buf)) {
+        if (state) *state = YORUKV_BLOCK_STATE_EMPTY;
+        if (seq) *seq = 0u;
+        if (erase_count) *erase_count = 0u;
+        if (is_valid) *is_valid = 1u;
+        return YORUKV_OK;
+    }
+
+    if ((((unsigned)buf[0]) | ((unsigned)buf[1] << 8)) != YORUKV_BLOCK_MAGIC) {
+        if (is_valid) *is_valid = 0u;
+        return YORUKV_OK;
+    }
+
+    if (state) *state = (unsigned)((unsigned)buf[2] | ((unsigned)buf[3] << 8));
+    if (seq) *seq = yorukv__read_u32_le_(&buf[4]);
+    if (erase_count) *erase_count = yorukv__read_u32_le_(&buf[8]);
+    if (is_valid) {
+        *is_valid = (unsigned)(yorukv__read_u32_le_(&buf[12]) ==
+                               yorukv__block_checksum_((unsigned)((unsigned)buf[2] | ((unsigned)buf[3] << 8)),
+                                                       yorukv__read_u32_le_(&buf[4]),
+                                                       yorukv__read_u32_le_(&buf[8])));
+    }
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_write_block_header_(YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index,
+                                                                       unsigned state, yorukv_u32_t seq, yorukv_u32_t erase_count)
+{
+    yorukv_u8_t buf[64];
+    yorukv_u32_t total_len;
+    yorukv_u32_t i;
+
+    if (!hkv || !hkv->Persist) return YORUKV_INVALID_PARAM;
+    total_len = yorukv__persist_block_header_span_(hkv);
+    if ((total_len == 0u) || (total_len > (yorukv_u32_t)sizeof(buf))) return YORUKV_INVALID_PARAM;
+
+    for (i = 0u; i < total_len; ++i) {
+        buf[i] = hkv->Persist->ErasedValue;
+    }
+
+    buf[0] = (yorukv_u8_t)(YORUKV_BLOCK_MAGIC & 0xFFu);
+    buf[1] = (yorukv_u8_t)((YORUKV_BLOCK_MAGIC >> 8) & 0xFFu);
+    yorukv__write_u16_le_(&buf[2], state);
+    yorukv__write_u32_le_(&buf[4], seq);
+    yorukv__write_u32_le_(&buf[8], erase_count);
+    yorukv__write_u32_le_(&buf[12], yorukv__block_checksum_(state, seq, erase_count));
+
+    if (hkv->Persist->Write(hkv->Persist->User, yorukv__persist_block_offset_(hkv, block_index), buf, total_len) != YORUKV_OK) {
+        return YORUKV_ERROR;
+    }
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_open_block_(YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index,
+                                                               yorukv_u32_t sequence, yorukv_u32_t erase_count)
+{
+    YORUKV_StatusTypeDef status = yorukv__persist_write_block_header_(hkv, block_index, YORUKV_BLOCK_STATE_ACTIVE, sequence, erase_count);
+    if (status != YORUKV_OK) return status;
+    hkv->PersistActiveBlock = block_index;
+    hkv->PersistWriteOffset = yorukv__persist_block_data_begin_(hkv, block_index);
+    if (sequence >= hkv->PersistNextBlockSeq) hkv->PersistNextBlockSeq = sequence + 1u;
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_erase_block_(YORUKV_HandleTypeDef *hkv, yorukv_u32_t block_index, yorukv_u32_t *erase_count_out)
+{
+    unsigned state = 0u, is_empty = 0u, is_valid = 0u;
+    yorukv_u32_t seq = 0u, erase_count = 0u;
+    YORUKV_StatusTypeDef status = yorukv__persist_read_block_header_(hkv, block_index, &state, &seq, &erase_count, &is_empty, &is_valid);
+    if (status != YORUKV_OK) return status;
+    if (hkv->Persist->Erase(hkv->Persist->User, yorukv__persist_block_offset_(hkv, block_index), yorukv__persist_block_size_(hkv)) != YORUKV_OK) {
+        return YORUKV_ERROR;
+    }
+    if (erase_count_out) *erase_count_out = erase_count + 1u;
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_find_empty_block_(YORUKV_HandleTypeDef *hkv, yorukv_u32_t *block_index)
+{
+    yorukv_u32_t i;
+    for (i = 0u; i < yorukv__persist_block_count_(hkv); ++i) {
+        unsigned state = 0u, is_empty = 0u, is_valid = 0u;
+        yorukv_u32_t seq = 0u, erase_count = 0u;
+        YORUKV_StatusTypeDef status = yorukv__persist_read_block_header_(hkv, i, &state, &seq, &erase_count, &is_empty, &is_valid);
+        if (status != YORUKV_OK) return status;
+        if (is_empty != 0u) {
+            *block_index = i;
+            return YORUKV_OK;
+        }
+    }
+    return YORUKV_NOT_FOUND;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_find_oldest_reclaimable_block_(YORUKV_HandleTypeDef *hkv, yorukv_u32_t *block_index)
+{
+    yorukv_u32_t i;
+    yorukv_u32_t best_seq = 0xFFFFFFFFu;
+    unsigned found = 0u;
+
+    for (i = 0u; i < yorukv__persist_block_count_(hkv); ++i) {
+        unsigned state = 0u, is_empty = 0u, is_valid = 0u;
+        yorukv_u32_t seq = 0u, erase_count = 0u;
+        YORUKV_StatusTypeDef status = yorukv__persist_read_block_header_(hkv, i, &state, &seq, &erase_count, &is_empty, &is_valid);
+        if (status != YORUKV_OK) return status;
+        if ((i != hkv->PersistActiveBlock) &&
+            (is_valid != 0u) &&
+            (is_empty == 0u) &&
+            ((state == YORUKV_BLOCK_STATE_ACTIVE) || (state == YORUKV_BLOCK_STATE_FULL)) &&
+            (seq < best_seq)) {
+            best_seq = seq;
+            *block_index = i;
+            found = 1u;
+        }
+    }
+
+    return found ? YORUKV_OK : YORUKV_NOT_FOUND;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_raw_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value, unsigned flags)
 {
     yorukv_u8_t record[512];
     yorukv_u32_t key_len;
@@ -428,8 +624,10 @@ static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTy
     yorukv_u32_t block_size;
     yorukv_u32_t value_offset;
     yorukv_u32_t i;
+    yorukv_u32_t block_end;
 
     if (!hkv || !hkv->Persist || !key || !value) return YORUKV_INVALID_PARAM;
+    if (hkv->PersistActiveBlock == 0xFFFFFFFFu) return YORUKV_NOT_INITIALIZED;
 
     key_len = yorukv__strlen_(key);
     value_len = yorukv__persist_value_len_(value);
@@ -438,13 +636,12 @@ static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTy
     raw_len = YORUKV_PERSIST_HEADER_SIZE + key_len + value_len;
     total_len = yorukv__align_up_(raw_len, block_size);
     value_offset = YORUKV_PERSIST_HEADER_SIZE + key_len;
+    block_end = yorukv__persist_block_data_end_(hkv, hkv->PersistActiveBlock);
 
     if ((key_len == 0u) || (key_len > 255u) || (value_len > 65535u) || (total_len > (yorukv_u32_t)sizeof(record))) return YORUKV_INVALID_PARAM;
-    if (hkv->PersistWriteOffset + total_len > hkv->Persist->Size) return YORUKV_NO_SPACE;
+    if (hkv->PersistWriteOffset + total_len > block_end) return YORUKV_NO_SPACE;
 
-    for (i = 0u; i < total_len; ++i) {
-        record[i] = hkv->Persist->ErasedValue;
-    }
+    for (i = 0u; i < total_len; ++i) record[i] = hkv->Persist->ErasedValue;
 
     record[0] = (yorukv_u8_t)(YORUKV_PERSIST_MAGIC & 0xFFu);
     record[1] = (yorukv_u8_t)((YORUKV_PERSIST_MAGIC >> 8) & 0xFFu);
@@ -457,22 +654,13 @@ static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTy
     yorukv__copy_bytes_(&record[YORUKV_PERSIST_HEADER_SIZE], key, key_len);
 
     switch (value->Type) {
-        case YORUKV_TYPE_BOOL:
-            record[value_offset] = value->Value.Bool;
-            break;
-        case YORUKV_TYPE_I32:
-            yorukv__copy_bytes_(&record[value_offset], &value->Value.I32, 4u);
-            break;
-        case YORUKV_TYPE_U32:
-            yorukv__copy_bytes_(&record[value_offset], &value->Value.U32, 4u);
-            break;
+        case YORUKV_TYPE_BOOL: record[value_offset] = value->Value.Bool; break;
+        case YORUKV_TYPE_I32: yorukv__copy_bytes_(&record[value_offset], &value->Value.I32, 4u); break;
+        case YORUKV_TYPE_U32: yorukv__copy_bytes_(&record[value_offset], &value->Value.U32, 4u); break;
         case YORUKV_TYPE_STRING:
-            if (value_len != 0u) {
-                yorukv__copy_bytes_(&record[value_offset], value->Value.String.Ptr, value_len);
-            }
+            if (value_len != 0u) yorukv__copy_bytes_(&record[value_offset], value->Value.String.Ptr, value_len);
             break;
-        default:
-            return YORUKV_ERROR;
+        default: return YORUKV_ERROR;
     }
 
     if (hkv->Persist->Write(hkv->Persist->User, hkv->PersistWriteOffset, record, total_len) != YORUKV_OK) return YORUKV_ERROR;
@@ -482,6 +670,119 @@ static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTy
     return YORUKV_OK;
 }
 
+static inline YORUKV_StatusTypeDef yorukv__persist_gc_with_pending_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value, unsigned flags)
+{
+    yorukv_u32_t target_block;
+    yorukv_u32_t erase_count = 0u;
+    yorukv_u32_t i;
+    YORUKV_StatusTypeDef status;
+
+    status = yorukv__persist_find_empty_block_(hkv, &target_block);
+    if (status == YORUKV_OK) {
+        erase_count = 1u;
+    } else {
+        status = yorukv__persist_find_oldest_reclaimable_block_(hkv, &target_block);
+        if (status != YORUKV_OK) {
+            if (hkv->PersistActiveBlock == 0xFFFFFFFFu) return YORUKV_NO_SPACE;
+            target_block = hkv->PersistActiveBlock;
+        }
+
+        status = yorukv__persist_erase_block_(hkv, target_block, &erase_count);
+        if (status != YORUKV_OK) return status;
+    }
+
+    status = yorukv__persist_open_block_(hkv, target_block, hkv->PersistNextBlockSeq, erase_count);
+    if (status != YORUKV_OK) return status;
+
+    for (i = 0u; i < hkv->Count; ++i) {
+        const YORUKV_ItemTypeDef *item = &hkv->Table[i];
+        YORUKV_ValueTypeDef current;
+        if (yorukv__streq_(item->Key, key)) {
+            continue;
+        }
+        status = yorukv__value_from_item_current_(item, &current);
+        if (status != YORUKV_OK) return status;
+        status = yorukv__persist_append_flags_raw_(hkv, item->Key, &current, YORUKV_PERSIST_FLAG_VALID);
+        if (status != YORUKV_OK) return status;
+    }
+
+    return yorukv__persist_append_flags_raw_(hkv, key, value, flags);
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_gc_only_(YORUKV_HandleTypeDef *hkv)
+{
+    yorukv_u32_t target_block;
+    yorukv_u32_t erase_count = 0u;
+    yorukv_u32_t i;
+    YORUKV_StatusTypeDef status;
+
+    status = yorukv__persist_find_empty_block_(hkv, &target_block);
+    if (status == YORUKV_OK) {
+        erase_count = 1u;
+    } else {
+        status = yorukv__persist_find_oldest_reclaimable_block_(hkv, &target_block);
+        if (status != YORUKV_OK) {
+            if (hkv->PersistActiveBlock == 0xFFFFFFFFu) return YORUKV_NO_SPACE;
+            target_block = hkv->PersistActiveBlock;
+        }
+
+        status = yorukv__persist_erase_block_(hkv, target_block, &erase_count);
+        if (status != YORUKV_OK) return status;
+    }
+
+    status = yorukv__persist_open_block_(hkv, target_block, hkv->PersistNextBlockSeq, erase_count);
+    if (status != YORUKV_OK) return status;
+
+    for (i = 0u; i < hkv->Count; ++i) {
+        const YORUKV_ItemTypeDef *item = &hkv->Table[i];
+        YORUKV_ValueTypeDef current;
+        status = yorukv__value_from_item_current_(item, &current);
+        if (status != YORUKV_OK) return status;
+        status = yorukv__persist_append_flags_raw_(hkv, item->Key, &current, YORUKV_PERSIST_FLAG_VALID);
+        if (status != YORUKV_OK) return status;
+    }
+
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_prepare_next_block_(YORUKV_HandleTypeDef *hkv)
+{
+    yorukv_u32_t block_index;
+    YORUKV_StatusTypeDef status;
+
+    status = yorukv__persist_find_empty_block_(hkv, &block_index);
+    if (status == YORUKV_OK) {
+        return yorukv__persist_open_block_(hkv, block_index, hkv->PersistNextBlockSeq, 1u);
+    }
+    return status;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_append_flags_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value, unsigned flags)
+{
+    YORUKV_StatusTypeDef status;
+
+    status = yorukv__persist_append_flags_raw_(hkv, key, value, flags);
+    if (status == YORUKV_OK) return status;
+    if (status != YORUKV_NO_SPACE) return status;
+
+    status = yorukv__persist_prepare_next_block_(hkv);
+    if (status == YORUKV_OK) {
+        status = yorukv__persist_append_flags_raw_(hkv, key, value, flags);
+        if (status == YORUKV_OK) return status;
+    }
+
+#if YORUKV_PERSIST_AUTO_GC
+    return yorukv__persist_gc_with_pending_(hkv, key, value, flags);
+#else
+    return YORUKV_NO_SPACE;
+#endif
+}
+
+static inline YORUKV_StatusTypeDef yorukv__persist_append_with_gc_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value)
+{
+    return yorukv__persist_append_flags_(hkv, key, value, YORUKV_PERSIST_FLAG_VALID);
+}
+
 static inline YORUKV_StatusTypeDef yorukv__persist_append_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value)
 {
     return yorukv__persist_append_flags_(hkv, key, value, YORUKV_PERSIST_FLAG_VALID);
@@ -489,63 +790,15 @@ static inline YORUKV_StatusTypeDef yorukv__persist_append_(YORUKV_HandleTypeDef 
 
 static inline YORUKV_StatusTypeDef yorukv__persist_gc_(YORUKV_HandleTypeDef *hkv)
 {
-    yorukv_u32_t i;
-
-    if (!hkv || !hkv->Persist) return YORUKV_INVALID_PARAM;
-    if (!hkv->Initialized) return YORUKV_NOT_INITIALIZED;
-
-    if (hkv->Persist->Erase(hkv->Persist->User, 0u, hkv->Persist->Size) != YORUKV_OK) return YORUKV_ERROR;
-
-    hkv->PersistWriteOffset = 0u;
-    hkv->PersistNextSeq = 1u;
-
-    for (i = 0u; i < hkv->Count; ++i) {
-        const YORUKV_ItemTypeDef *item = &hkv->Table[i];
-        YORUKV_ValueTypeDef value;
-        YORUKV_StatusTypeDef status;
-
-        status = yorukv__value_from_item_current_(item, &value);
-        if (status != YORUKV_OK) return status;
-
-        status = yorukv__persist_append_(hkv, item->Key, &value);
-        if (status != YORUKV_OK) return status;
-    }
-
-    return YORUKV_OK;
-}
-
-static inline YORUKV_StatusTypeDef yorukv__persist_append_with_gc_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ValueTypeDef *value)
-{
-    YORUKV_StatusTypeDef status = yorukv__persist_append_flags_(hkv, key, value, YORUKV_PERSIST_FLAG_VALID);
-
-#if YORUKV_PERSIST_AUTO_GC
-    if (status == YORUKV_NO_SPACE) {
-        status = yorukv__persist_gc_(hkv);
-        if (status != YORUKV_OK) return status;
-        status = yorukv__persist_append_flags_(hkv, key, value, YORUKV_PERSIST_FLAG_VALID);
-    }
-#endif
-
-    return status;
+    return yorukv__persist_gc_only_(hkv);
 }
 
 static inline YORUKV_StatusTypeDef yorukv__persist_delete_with_gc_(YORUKV_HandleTypeDef *hkv, const char *key, const YORUKV_ItemTypeDef *item)
 {
     YORUKV_ValueTypeDef value;
-    YORUKV_StatusTypeDef status;
-
-    status = yorukv__value_from_item_current_(item, &value);
+    YORUKV_StatusTypeDef status = yorukv__value_from_item_current_(item, &value);
     if (status != YORUKV_OK) return status;
-
-    status = yorukv__persist_append_flags_(hkv, key, &value, YORUKV_PERSIST_FLAG_DELETED);
-#if YORUKV_PERSIST_AUTO_GC
-    if (status == YORUKV_NO_SPACE) {
-        status = yorukv__persist_gc_(hkv);
-        if (status != YORUKV_OK) return status;
-        status = yorukv__persist_append_flags_(hkv, key, &value, YORUKV_PERSIST_FLAG_DELETED);
-    }
-#endif
-    return status;
+    return yorukv__persist_append_flags_(hkv, key, &value, YORUKV_PERSIST_FLAG_DELETED);
 }
 #endif
 
@@ -566,8 +819,10 @@ static inline YORUKV_StatusTypeDef YORUKV_Init(YORUKV_HandleTypeDef *hkv, const 
     hkv->Initialized = 1u;
 #if YORUKV_ENABLE_PERSIST
     hkv->Persist = (const YORUKV_PersistConfigTypeDef *)0;
+    hkv->PersistActiveBlock = 0xFFFFFFFFu;
     hkv->PersistWriteOffset = 0u;
     hkv->PersistNextSeq = 1u;
+    hkv->PersistNextBlockSeq = 1u;
 #endif
     return YORUKV_OK;
 }
@@ -727,11 +982,16 @@ static inline YORUKV_StatusTypeDef YORUKV_AttachPersist(YORUKV_HandleTypeDef *hk
         return YORUKV_INVALID_PARAM;
     }
     if (!hkv->Initialized) return YORUKV_NOT_INITIALIZED;
-    if ((persist->WriteBlockSize != 0u) && (persist->Size % persist->WriteBlockSize != 0u)) return YORUKV_INVALID_PARAM;
+    if ((persist->BlockSize == 0u) || (persist->BlockCount == 0u)) return YORUKV_INVALID_PARAM;
+    if (persist->Size != (persist->BlockSize * persist->BlockCount)) return YORUKV_INVALID_PARAM;
+    if (persist->BlockSize <= yorukv__align_up_(YORUKV_BLOCK_HEADER_SIZE, (persist->WriteBlockSize == 0u) ? 1u : persist->WriteBlockSize)) return YORUKV_INVALID_PARAM;
+    if ((persist->WriteBlockSize != 0u) && (persist->BlockSize % persist->WriteBlockSize != 0u)) return YORUKV_INVALID_PARAM;
 
     hkv->Persist = persist;
+    hkv->PersistActiveBlock = 0xFFFFFFFFu;
     hkv->PersistWriteOffset = 0u;
     hkv->PersistNextSeq = 1u;
+    hkv->PersistNextBlockSeq = 1u;
     return YORUKV_OK;
 }
 
@@ -740,17 +1000,20 @@ static inline YORUKV_StatusTypeDef YORUKV_FormatPersist(YORUKV_HandleTypeDef *hk
     if (!hkv || !hkv->Persist) return YORUKV_INVALID_PARAM;
     if (!hkv->Initialized) return YORUKV_NOT_INITIALIZED;
     if (hkv->Persist->Erase(hkv->Persist->User, 0u, hkv->Persist->Size) != YORUKV_OK) return YORUKV_ERROR;
+    hkv->PersistActiveBlock = 0xFFFFFFFFu;
     hkv->PersistWriteOffset = 0u;
     hkv->PersistNextSeq = 1u;
-    return YORUKV_OK;
+    hkv->PersistNextBlockSeq = 1u;
+    return yorukv__persist_open_block_(hkv, 0u, 1u, 1u);
 }
 
 static inline YORUKV_StatusTypeDef YORUKV_LoadPersist(YORUKV_HandleTypeDef *hkv)
 {
     yorukv_u32_t i;
-    yorukv_u32_t offset = 0u;
     yorukv_u32_t max_seq = 0u;
-    yorukv_u8_t header[YORUKV_PERSIST_HEADER_SIZE];
+    yorukv_u32_t max_block_seq = 0u;
+    yorukv_u32_t active_block = 0xFFFFFFFFu;
+    yorukv_u32_t active_write_offset = 0u;
 
     if (!hkv || !hkv->Persist) return YORUKV_INVALID_PARAM;
     if (!hkv->Initialized) return YORUKV_NOT_INITIALIZED;
@@ -760,109 +1023,125 @@ static inline YORUKV_StatusTypeDef YORUKV_LoadPersist(YORUKV_HandleTypeDef *hkv)
         if (status != YORUKV_OK) return status;
     }
 
-    while (offset + YORUKV_PERSIST_HEADER_SIZE <= hkv->Persist->Size) {
-        yorukv_u32_t key_len;
-        yorukv_u32_t value_len;
-        yorukv_u32_t seq;
-        yorukv_u32_t total_len;
-        yorukv_u32_t stored_crc;
-        yorukv_u32_t flags;
-        yorukv_u8_t type;
-        const YORUKV_ItemTypeDef *item;
-        char key_buf[256];
-        YORUKV_ValueTypeDef value;
-        yorukv_u32_t block_size = (hkv->Persist->WriteBlockSize == 0u) ? 1u : hkv->Persist->WriteBlockSize;
+    for (i = 0u; i < yorukv__persist_block_count_(hkv); ++i) {
+        unsigned state = 0u, is_empty = 0u, is_valid = 0u;
+        yorukv_u32_t block_seq = 0u, erase_count = 0u;
+        YORUKV_StatusTypeDef status = yorukv__persist_read_block_header_(hkv, i, &state, &block_seq, &erase_count, &is_empty, &is_valid);
+        if (status != YORUKV_OK) return status;
+        if ((is_valid == 0u) || (is_empty != 0u)) continue;
+        if ((state != YORUKV_BLOCK_STATE_ACTIVE) && (state != YORUKV_BLOCK_STATE_FULL)) continue;
+        if (block_seq > max_block_seq) max_block_seq = block_seq;
+    }
 
-        if (hkv->Persist->Read(hkv->Persist->User, offset, header, YORUKV_PERSIST_HEADER_SIZE) != YORUKV_OK) return YORUKV_ERROR;
+    {
+        yorukv_u32_t pass;
+        for (pass = 1u; pass <= max_block_seq; ++pass) {
+            for (i = 0u; i < yorukv__persist_block_count_(hkv); ++i) {
+                unsigned state = 0u, is_empty = 0u, is_valid = 0u;
+                yorukv_u32_t block_seq = 0u, erase_count = 0u;
+                YORUKV_StatusTypeDef status = yorukv__persist_read_block_header_(hkv, i, &state, &block_seq, &erase_count, &is_empty, &is_valid);
+                if (status != YORUKV_OK) return status;
+                if ((is_valid == 0u) || (is_empty != 0u) || (block_seq != pass)) continue;
 
-        if ((header[0] == hkv->Persist->ErasedValue) && (header[1] == hkv->Persist->ErasedValue) &&
-            (header[2] == hkv->Persist->ErasedValue) && (header[3] == hkv->Persist->ErasedValue)) {
-            break;
-        }
+                {
+                    yorukv_u32_t offset = yorukv__persist_block_data_begin_(hkv, i);
+                    yorukv_u32_t block_end = yorukv__persist_block_data_end_(hkv, i);
+                    yorukv_u8_t header[YORUKV_PERSIST_HEADER_SIZE];
+                    while (offset + YORUKV_PERSIST_HEADER_SIZE <= block_end) {
+                        yorukv_u32_t key_len;
+                        yorukv_u32_t value_len;
+                        yorukv_u32_t seq;
+                        yorukv_u32_t total_len;
+                        yorukv_u32_t stored_crc;
+                        yorukv_u32_t flags;
+                        yorukv_u8_t type;
+                        const YORUKV_ItemTypeDef *item;
+                        char key_buf[256];
+                        YORUKV_ValueTypeDef value;
+                        yorukv_u32_t align = (hkv->Persist->WriteBlockSize == 0u) ? 1u : hkv->Persist->WriteBlockSize;
 
-        if (((unsigned)header[0] | ((unsigned)header[1] << 8)) != YORUKV_PERSIST_MAGIC) {
-            break;
-        }
-
-        key_len = header[2];
-        type = header[3];
-        value_len = (yorukv_u32_t)header[4] | ((yorukv_u32_t)header[5] << 8);
-        flags = (yorukv_u32_t)header[6] | ((yorukv_u32_t)header[7] << 8);
-        seq = yorukv__read_u32_le_(&header[8]);
-        stored_crc = yorukv__read_u32_le_(&header[12]);
-        total_len = yorukv__align_up_(YORUKV_PERSIST_HEADER_SIZE + key_len + value_len, block_size);
-
-        if ((key_len == 0u) || (key_len >= (yorukv_u32_t)sizeof(key_buf)) || (offset + total_len > hkv->Persist->Size)) {
-            break;
-        }
-
-        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE, key_buf, key_len) != YORUKV_OK) return YORUKV_ERROR;
-        key_buf[key_len] = '\0';
-
-        item = yorukv__find_n_(hkv, key_buf, key_len);
-        if (item) {
-            value.Type = type;
-            switch (type) {
-                case YORUKV_TYPE_BOOL:
-                    if (value_len == 1u) {
-                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.Bool, 1u) != YORUKV_OK) return YORUKV_ERROR;
-                    } else {
-                        item = (const YORUKV_ItemTypeDef *)0;
-                    }
-                    break;
-                case YORUKV_TYPE_I32:
-                    if (value_len == 4u) {
-                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.I32, 4u) != YORUKV_OK) return YORUKV_ERROR;
-                    } else {
-                        item = (const YORUKV_ItemTypeDef *)0;
-                    }
-                    break;
-                case YORUKV_TYPE_U32:
-                    if (value_len == 4u) {
-                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.U32, 4u) != YORUKV_OK) return YORUKV_ERROR;
-                    } else {
-                        item = (const YORUKV_ItemTypeDef *)0;
-                    }
-                    break;
-                case YORUKV_TYPE_STRING:
-                    if ((item->Capacity != 0u) && (value_len + 1u <= item->Capacity)) {
-                        value.Value.String.Ptr = (const char *)item->DataPtr;
-                        value.Value.String.Len = value_len;
-                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, item->DataPtr, value_len) != YORUKV_OK) return YORUKV_ERROR;
-                        ((char *)item->DataPtr)[value_len] = '\0';
-                    } else {
-                        item = (const YORUKV_ItemTypeDef *)0;
-                    }
-                    break;
-                default:
-                    item = (const YORUKV_ItemTypeDef *)0;
-                    break;
-            }
-
-            if (item) {
-                if (stored_crc == yorukv__persist_checksum_(key_buf, key_len, &value, seq, (unsigned)flags)) {
-                    if ((flags & YORUKV_PERSIST_FLAG_DELETED) != 0u) {
-                        YORUKV_StatusTypeDef status = yorukv__reset_item_(item);
-                        if (status != YORUKV_OK) return status;
-                    } else {
-                        if (type != YORUKV_TYPE_STRING) {
-                            YORUKV_StatusTypeDef status = yorukv__set_value_to_item_(item, &value);
-                            if (status != YORUKV_OK) return status;
+                        if (hkv->Persist->Read(hkv->Persist->User, offset, header, YORUKV_PERSIST_HEADER_SIZE) != YORUKV_OK) return YORUKV_ERROR;
+                        if ((header[0] == hkv->Persist->ErasedValue) && (header[1] == hkv->Persist->ErasedValue) &&
+                            (header[2] == hkv->Persist->ErasedValue) && (header[3] == hkv->Persist->ErasedValue)) {
+                            break;
                         }
+                        if ((((unsigned)header[0]) | ((unsigned)header[1] << 8)) != YORUKV_PERSIST_MAGIC) break;
+
+                        key_len = header[2];
+                        type = header[3];
+                        value_len = (yorukv_u32_t)header[4] | ((yorukv_u32_t)header[5] << 8);
+                        flags = (yorukv_u32_t)header[6] | ((yorukv_u32_t)header[7] << 8);
+                        seq = yorukv__read_u32_le_(&header[8]);
+                        stored_crc = yorukv__read_u32_le_(&header[12]);
+                        total_len = yorukv__align_up_(YORUKV_PERSIST_HEADER_SIZE + key_len + value_len, align);
+                        if ((key_len == 0u) || (key_len >= (yorukv_u32_t)sizeof(key_buf)) || (offset + total_len > block_end)) break;
+
+                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE, key_buf, key_len) != YORUKV_OK) return YORUKV_ERROR;
+                        key_buf[key_len] = '\0';
+
+                        item = yorukv__find_n_(hkv, key_buf, key_len);
+                        if (item) {
+                            value.Type = type;
+                            switch (type) {
+                                case YORUKV_TYPE_BOOL:
+                                    if (value_len == 1u) {
+                                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.Bool, 1u) != YORUKV_OK) return YORUKV_ERROR;
+                                    } else item = (const YORUKV_ItemTypeDef *)0;
+                                    break;
+                                case YORUKV_TYPE_I32:
+                                    if (value_len == 4u) {
+                                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.I32, 4u) != YORUKV_OK) return YORUKV_ERROR;
+                                    } else item = (const YORUKV_ItemTypeDef *)0;
+                                    break;
+                                case YORUKV_TYPE_U32:
+                                    if (value_len == 4u) {
+                                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, &value.Value.U32, 4u) != YORUKV_OK) return YORUKV_ERROR;
+                                    } else item = (const YORUKV_ItemTypeDef *)0;
+                                    break;
+                                case YORUKV_TYPE_STRING:
+                                    if ((item->Capacity != 0u) && (value_len + 1u <= item->Capacity)) {
+                                        value.Value.String.Ptr = (const char *)item->DataPtr;
+                                        value.Value.String.Len = value_len;
+                                        if (hkv->Persist->Read(hkv->Persist->User, offset + YORUKV_PERSIST_HEADER_SIZE + key_len, item->DataPtr, value_len) != YORUKV_OK) return YORUKV_ERROR;
+                                        ((char *)item->DataPtr)[value_len] = '\0';
+                                    } else item = (const YORUKV_ItemTypeDef *)0;
+                                    break;
+                                default: item = (const YORUKV_ItemTypeDef *)0; break;
+                            }
+
+                            if (item) {
+                                if (stored_crc == yorukv__persist_checksum_(key_buf, key_len, &value, seq, (unsigned)flags)) {
+                                    if ((flags & YORUKV_PERSIST_FLAG_DELETED) != 0u) {
+                                        status = yorukv__reset_item_(item);
+                                    } else if (type != YORUKV_TYPE_STRING) {
+                                        status = yorukv__set_value_to_item_(item, &value);
+                                    } else {
+                                        status = YORUKV_OK;
+                                    }
+                                    if (status != YORUKV_OK) return status;
+                                    if (seq > max_seq) max_seq = seq;
+                                }
+                            }
+                        }
+
+                        offset += total_len;
                     }
-                    if ((flags & (YORUKV_PERSIST_FLAG_VALID | YORUKV_PERSIST_FLAG_DELETED)) != 0u) {
-                        if (seq > max_seq) max_seq = seq;
+
+                    if (state == YORUKV_BLOCK_STATE_ACTIVE) {
+                        active_block = i;
+                        active_write_offset = offset;
                     }
                 }
             }
         }
-
-        offset += total_len;
     }
 
-    hkv->PersistWriteOffset = offset;
+    hkv->PersistActiveBlock = active_block;
+    hkv->PersistWriteOffset = active_write_offset;
     hkv->PersistNextSeq = max_seq + 1u;
+    hkv->PersistNextBlockSeq = max_block_seq + 1u;
     if (hkv->PersistNextSeq == 0u) hkv->PersistNextSeq = 1u;
+    if (hkv->PersistNextBlockSeq == 0u) hkv->PersistNextBlockSeq = 1u;
     return YORUKV_OK;
 }
 
