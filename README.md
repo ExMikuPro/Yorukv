@@ -2,102 +2,52 @@
 
 Yorukv is a lightweight single-header KV helper for STM32-style embedded projects.
 
-The current stage focuses on a small and predictable key-value layer with optional single-region log persistence. It is designed to stay simple:
-
-* no dynamic memory
-* no `printf`
-* no stdlib-heavy runtime dependency
-* user-controlled feature growth through macros
-
 Repository:
 
-* [ExMikuPro/Yorukv](https://github.com/ExMikuPro/Yorukv.git)
+---
+
+> **Yoru Series**
+>
+> A family of lightweight utility libraries for STM32 HAL. Each library can be used independently or combined as needed.
+>
+> | Library | Role |
+> | --- | --- |
+> | [Yorulog](https://github.com/ExMikuPro/Yorulog) | Lightweight UART logger |
+> | [Yorush](https://github.com/ExMikuPro/Yorush) | Lightweight UART shell / command parser |
+> | [Yorunvm](https://github.com/ExMikuPro/Yorunvm) | STM32 on-chip NVM / Flash access helper |
+> | [Yorukv](https://github.com/ExMikuPro/Yorukv) | Lightweight KV configuration library |
+> | [Yorubench](https://github.com/ExMikuPro/Yorubench) | Lightweight performance measurement library |
 
 ---
 
-## Current Scope
+## Features
 
-Current stage includes:
-
-* single-header KV core
-* fixed table registration
+* single-header
+* no dynamic memory
+* fixed key table
 * `bool` / `i32` / `u32` / `string`
-* `Init`
-* `Get`
-* `Set`
-* `Reset`
-* `Delete`
-* `List`
-* optional single-region log persistence backend
-* startup reload from persisted log
-* automatic compact GC when log space is exhausted
-* `NO_SPACE` return when data still cannot fit after GC
-
-Not included in the current stage:
-
-* wear leveling policy
-* multi-region / dual-bank migration
-* page-level GC
-* external Flash adaptation
-* file system style abstraction
-* dynamic schema / runtime key registration
-
----
-
-## Design Goals
-
-* small
-* predictable
-* low RAM cost
-* no hidden allocator
-* clear separation between KV policy and storage backend
-
-Yorukv is intended to be a KV layer, not a large storage framework.
-
----
+* optional persistence backend
+* append-only log + reload + delete + GC
 
 ## Quick Start
 
-Place `yorukv.h` into your project, for example:
-
-```text
-/Core/Yorukv/yorukv.h
-```
-
-In exactly one `.c` file:
+In one `.c` file:
 
 ```c
-#define YORUKV_DEFINE_GLOBALS
-#include "yorukv.h"
-```
-
-In other `.c` files:
-
-```c
-#include "yorukv.h"
-```
-
----
-
-## Basic KV Usage
-
-```c
+#define YORUKV_ENABLE_FULL_API 1
 #define YORUKV_DEFINE_GLOBALS
 #include "yorukv.h"
 
 static yorukv_bool_t led_enable;
-static yorukv_i32_t threshold;
 static yorukv_u32_t baud;
 static char name[16];
 
 static const yorukv_bool_t led_default = 0u;
-static const yorukv_i32_t threshold_default = -10;
 static const yorukv_u32_t baud_default = 115200u;
 static const char name_default[] = "yoru";
 
 static const YORUKV_ItemTypeDef app_kv[] = {
     YORUKV_ITEM_BOOL_RW("led", &led_enable, &led_default),
-    YORUKV_ITEM_I32_RW("threshold", &threshold, &threshold_default),
     YORUKV_ITEM_U32_RW("baud", &baud, &baud_default),
     YORUKV_ITEM_STR_RW("name", name, sizeof(name), name_default),
 };
@@ -108,118 +58,50 @@ void app_kv_init(void)
 }
 ```
 
----
-
-## Core API
+Use it:
 
 ```c
-YORUKV_StatusTypeDef YORUKV_Init(YORUKV_HandleTypeDef *hkv,
-                                 const YORUKV_ItemTypeDef *table,
-                                 yorukv_u32_t count);
+bool led = false;
+uint32_t baud_now = 0;
+char name_buf[16];
 
-YORUKV_StatusTypeDef YORUKV_Get(YORUKV_HandleTypeDef *hkv,
-                                const char *key,
-                                YORUKV_ValueTypeDef *out);
+YORUKV_SetBool(&hYorukv, "led", true);
+YORUKV_SetU32(&hYorukv, "baud", 230400u);
+YORUKV_SetStr(&hYorukv, "name", "yorukv");
 
-YORUKV_StatusTypeDef YORUKV_Set(YORUKV_HandleTypeDef *hkv,
-                                const char *key,
-                                const YORUKV_ValueTypeDef *value);
-
-YORUKV_StatusTypeDef YORUKV_Reset(YORUKV_HandleTypeDef *hkv,
-                                  const char *key);
-
-YORUKV_StatusTypeDef YORUKV_Delete(YORUKV_HandleTypeDef *hkv,
-                                   const char *key);
-
-YORUKV_StatusTypeDef YORUKV_List(YORUKV_HandleTypeDef *hkv,
-                                 YORUKV_ListCallbackTypeDef cb,
-                                 void *user);
+YORUKV_GetBool(&hYorukv, "led", &led);
+YORUKV_GetU32(&hYorukv, "baud", &baud_now);
+YORUKV_GetStr(&hYorukv, "name", name_buf, sizeof(name_buf));
 ```
 
-Meaning:
+## Optional Persistence
 
-* `Set`: updates the current value
-* `Reset`: restores the default value
-* `Delete`: for the current stage, restores the item to its default value
-* `List`: iterates over registered items
-
----
-
-## Persistence Model
-
-Persistence is optional and backend-driven.
-
-Yorukv does not directly bind itself to one fixed storage medium. Instead, the current stage uses a small callback-based backend:
+Attach your own backend:
 
 ```c
-typedef struct
-{
-    YORUKV_PersistReadFunc Read;
-    YORUKV_PersistWriteFunc Write;
-    YORUKV_PersistEraseFunc Erase;
-    void *User;
-    yorukv_u32_t Size;
-    yorukv_u32_t WriteBlockSize;
-    yorukv_u8_t ErasedValue;
-} YORUKV_PersistConfigTypeDef;
+static const YORUKV_PersistConfigTypeDef kv_persist = {
+    kv_read,
+    kv_write,
+    kv_erase,
+    0,
+    0x00040000u,
+    0x00020000u,
+    2u,
+    32u,
+    0xFFu
+};
+
+YORUKV_UsePersist(&hYorukv, &kv_persist);
+YORUKV_Format(&hYorukv); /* first time */
+YORUKV_Load(&hYorukv);   /* next boot */
 ```
 
-Attach and use:
+Yorukv does not bind itself to one storage driver.
+You can connect it to STM32 internal Flash, EEPROM, RAM simulation, or your own backend callbacks.
 
-```c
-YORUKV_AttachPersist(&hYorukv, &persist_cfg);
-YORUKV_FormatPersist(&hYorukv);
-YORUKV_LoadPersist(&hYorukv);
-YORUKV_RunGC(&hYorukv);
-```
+## Notes
 
-Current persistence behavior:
-
-* single-region append-only log
-* reload by scanning the log from the beginning
-* latest valid record wins
-* delete is stored as a delete record
-* automatic compact GC is attempted when append space is exhausted
-
----
-
-## Backend Notes
-
-The current persistence design works best when:
-
-* `WriteBlockSize` matches the real write granularity of the storage medium
-* `Erase` clears the whole persistence region or the requested range to one erased byte pattern
-* `ErasedValue` matches the backend's erased byte value, typically `0xFF`
-
-For STM32 internal Flash, this can be adapted through a lower NVM layer such as Yorunvm.
-
----
-
-## Status Codes
-
-Main status codes:
-
-* `YORUKV_OK`
-* `YORUKV_ERROR`
-* `YORUKV_INVALID_PARAM`
-* `YORUKV_NOT_INITIALIZED`
-* `YORUKV_NOT_FOUND`
-* `YORUKV_TYPE_MISMATCH`
-* `YORUKV_READ_ONLY`
-* `YORUKV_NO_SPACE`
-
----
-
-## Verified Current Stage
-
-The current stage has been verified in two ways:
-
-* host-side callback backend tests
-* STM32H743 real Flash test with:
-  * append log
-  * reload
-  * delete record
-  * automatic recovery to default after delete
-
-This means the current single-region log path is not only a host simulation path. It has already been exercised on real STM32 internal Flash.
-
+* `ResetKey` restores the default value
+* `DeleteKey` currently also restores the default value
+* `FULL` API is a thin helper layer for easier usage
+* core API is still available for smaller or stricter builds
