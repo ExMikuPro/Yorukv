@@ -5,6 +5,22 @@
 extern "C" {
 #endif
 
+#ifndef YORUKV_USE_YORUNVM
+#define YORUKV_USE_YORUNVM 0
+#endif
+
+#if YORUKV_USE_YORUNVM
+  #ifndef YORUKV_YORUNVM_HEADER
+    #define YORUKV_YORUNVM_HEADER "yorunvm.h"
+  #endif
+  #include YORUKV_YORUNVM_HEADER
+#endif
+
+#if defined(YORUKV_ENABLE_FULL_API) && (YORUKV_ENABLE_FULL_API != 0)
+  #include <stdbool.h>
+  #include <stdint.h>
+#endif
+
 /* =========================================================
  *  Minimal Integer Types (no stdint/stddef dependency)
  * ========================================================= */
@@ -57,6 +73,10 @@ typedef yorukv_u8_t yorukv_bool_t;
 
 #ifndef YORUKV_ENABLE_PERSIST
 #define YORUKV_ENABLE_PERSIST 1
+#endif
+
+#ifndef YORUKV_ENABLE_FULL_API
+#define YORUKV_ENABLE_FULL_API 0
 #endif
 
 #ifndef YORUKV_PERSIST_AUTO_GC
@@ -148,6 +168,14 @@ typedef struct
 
 typedef void (*YORUKV_ListCallbackTypeDef)(const YORUKV_ItemTypeDef *item, void *user);
 
+#if YORUKV_USE_YORUNVM
+typedef struct
+{
+    yorukv_u32_t BaseAddr;
+    yorukv_u32_t Size;
+} YORUKV_YorunvmBridgeTypeDef;
+#endif
+
 #define YORUKV_FLAG_WRITABLE 0x01u
 
 #define YORUKV_ITEM_BOOL_RW(key, data_ptr, default_ptr) \
@@ -167,8 +195,16 @@ typedef void (*YORUKV_ListCallbackTypeDef)(const YORUKV_ItemTypeDef *item, void 
  */
 #if defined(YORUKV_DEFINE_GLOBALS)
 YORUKV_HandleTypeDef hYorukv;
+#if YORUKV_USE_YORUNVM
+YORUKV_YorunvmBridgeTypeDef hYorukvYorunvmBridge;
+YORUKV_PersistConfigTypeDef hYorukvYorunvmPersist;
+#endif
 #else
 extern YORUKV_HandleTypeDef hYorukv;
+#if YORUKV_USE_YORUNVM
+extern YORUKV_YorunvmBridgeTypeDef hYorukvYorunvmBridge;
+extern YORUKV_PersistConfigTypeDef hYorukvYorunvmPersist;
+#endif
 #endif
 
 /* =========================================================
@@ -1151,7 +1187,209 @@ static inline YORUKV_StatusTypeDef YORUKV_RunGC(YORUKV_HandleTypeDef *hkv)
 }
 #endif
 
+#if YORUKV_USE_YORUNVM
+static inline YORUKV_StatusTypeDef yorukv__map_yorunvm_status_(YORUNVM_StatusTypeDef status)
+{
+    return (status == YORUNVM_OK) ? YORUKV_OK : YORUKV_ERROR;
+}
+
+static inline YORUKV_StatusTypeDef yorukv__yorunvm_read_(void *user, yorukv_u32_t offset, void *dst, yorukv_u32_t len)
+{
+    YORUKV_YorunvmBridgeTypeDef *ctx = (YORUKV_YorunvmBridgeTypeDef *)user;
+    if (!ctx) return YORUKV_INVALID_PARAM;
+    if (YORUNVM_Init(ctx->BaseAddr, ctx->Size) != YORUNVM_OK) return YORUKV_ERROR;
+    return yorukv__map_yorunvm_status_(YORUNVM_FlashRead(ctx->BaseAddr + offset, dst, len));
+}
+
+static inline YORUKV_StatusTypeDef yorukv__yorunvm_write_(void *user, yorukv_u32_t offset, const void *src, yorukv_u32_t len)
+{
+    YORUKV_YorunvmBridgeTypeDef *ctx = (YORUKV_YorunvmBridgeTypeDef *)user;
+    if (!ctx) return YORUKV_INVALID_PARAM;
+    if (YORUNVM_Init(ctx->BaseAddr, ctx->Size) != YORUNVM_OK) return YORUKV_ERROR;
+    return yorukv__map_yorunvm_status_(YORUNVM_FlashWrite(ctx->BaseAddr + offset, src, len));
+}
+
+static inline YORUKV_StatusTypeDef yorukv__yorunvm_erase_(void *user, yorukv_u32_t offset, yorukv_u32_t len)
+{
+    YORUKV_YorunvmBridgeTypeDef *ctx = (YORUKV_YorunvmBridgeTypeDef *)user;
+    if (!ctx) return YORUKV_INVALID_PARAM;
+    if (YORUNVM_Init(ctx->BaseAddr, ctx->Size) != YORUNVM_OK) return YORUKV_ERROR;
+    return yorukv__map_yorunvm_status_(YORUNVM_FlashErase(ctx->BaseAddr + offset, len));
+}
+#endif
+
+#if YORUKV_ENABLE_FULL_API
+static inline YORUKV_StatusTypeDef YORUKV_UsePersist(YORUKV_HandleTypeDef *hkv, const YORUKV_PersistConfigTypeDef *persist)
+{
+#if YORUKV_ENABLE_PERSIST
+    return YORUKV_AttachPersist(hkv, persist);
+#else
+    (void)hkv;
+    (void)persist;
+    return YORUKV_UNSUPPORTED;
+#endif
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_Format(YORUKV_HandleTypeDef *hkv)
+{
+#if YORUKV_ENABLE_PERSIST
+    return YORUKV_FormatPersist(hkv);
+#else
+    (void)hkv;
+    return YORUKV_UNSUPPORTED;
+#endif
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_Load(YORUKV_HandleTypeDef *hkv)
+{
+#if YORUKV_ENABLE_PERSIST
+    return YORUKV_LoadPersist(hkv);
+#else
+    (void)hkv;
+    return YORUKV_UNSUPPORTED;
+#endif
+}
+
+#if YORUKV_USE_YORUNVM
+static inline YORUKV_StatusTypeDef YORUKV_UseYorunvm(YORUKV_HandleTypeDef *hkv,
+                                                     yorukv_u32_t base_addr,
+                                                     yorukv_u32_t size,
+                                                     yorukv_u32_t block_size,
+                                                     yorukv_u32_t block_count)
+{
+    if (!hkv) return YORUKV_INVALID_PARAM;
+    if (YORUNVM_Init(base_addr, size) != YORUNVM_OK) return YORUKV_ERROR;
+
+    hYorukvYorunvmBridge.BaseAddr = base_addr;
+    hYorukvYorunvmBridge.Size = size;
+
+    hYorukvYorunvmPersist.Read = yorukv__yorunvm_read_;
+    hYorukvYorunvmPersist.Write = yorukv__yorunvm_write_;
+    hYorukvYorunvmPersist.Erase = yorukv__yorunvm_erase_;
+    hYorukvYorunvmPersist.User = &hYorukvYorunvmBridge;
+    hYorukvYorunvmPersist.Size = size;
+    hYorukvYorunvmPersist.BlockSize = block_size;
+    hYorukvYorunvmPersist.BlockCount = block_count;
+    hYorukvYorunvmPersist.WriteBlockSize = (yorukv_u32_t)YORUNVM_FLASH_WRITE_UNIT;
+    hYorukvYorunvmPersist.ErasedValue = 0xFFu;
+
+    return YORUKV_UsePersist(hkv, &hYorukvYorunvmPersist);
+}
+#endif
+#endif
+
 #endif /* YORUKV_ENABLE */
+
+#if YORUKV_ENABLE_FULL_API
+static inline YORUKV_StatusTypeDef YORUKV_SetBool(YORUKV_HandleTypeDef *hkv, const char *key, bool value)
+{
+    YORUKV_ValueTypeDef v;
+    v.Type = YORUKV_TYPE_BOOL;
+    v.Value.Bool = value ? 1u : 0u;
+    return YORUKV_Set(hkv, key, &v);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_SetI32(YORUKV_HandleTypeDef *hkv, const char *key, int32_t value)
+{
+    YORUKV_ValueTypeDef v;
+    v.Type = YORUKV_TYPE_I32;
+    v.Value.I32 = (yorukv_i32_t)value;
+    return YORUKV_Set(hkv, key, &v);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_SetU32(YORUKV_HandleTypeDef *hkv, const char *key, uint32_t value)
+{
+    YORUKV_ValueTypeDef v;
+    v.Type = YORUKV_TYPE_U32;
+    v.Value.U32 = (yorukv_u32_t)value;
+    return YORUKV_Set(hkv, key, &v);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_SetStr(YORUKV_HandleTypeDef *hkv, const char *key, const char *value)
+{
+    YORUKV_ValueTypeDef v;
+
+    if (!value) return YORUKV_INVALID_PARAM;
+
+    v.Type = YORUKV_TYPE_STRING;
+    v.Value.String.Ptr = value;
+    v.Value.String.Len = yorukv__strlen_(value);
+    return YORUKV_Set(hkv, key, &v);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_GetBool(YORUKV_HandleTypeDef *hkv, const char *key, bool *out)
+{
+    YORUKV_ValueTypeDef v;
+    YORUKV_StatusTypeDef status;
+
+    if (!out) return YORUKV_INVALID_PARAM;
+    status = YORUKV_Get(hkv, key, &v);
+    if (status != YORUKV_OK) return status;
+    if (v.Type != YORUKV_TYPE_BOOL) return YORUKV_TYPE_MISMATCH;
+    *out = (v.Value.Bool != 0u) ? true : false;
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_GetI32(YORUKV_HandleTypeDef *hkv, const char *key, int32_t *out)
+{
+    YORUKV_ValueTypeDef v;
+    YORUKV_StatusTypeDef status;
+
+    if (!out) return YORUKV_INVALID_PARAM;
+    status = YORUKV_Get(hkv, key, &v);
+    if (status != YORUKV_OK) return status;
+    if (v.Type != YORUKV_TYPE_I32) return YORUKV_TYPE_MISMATCH;
+    *out = (int32_t)v.Value.I32;
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_GetU32(YORUKV_HandleTypeDef *hkv, const char *key, uint32_t *out)
+{
+    YORUKV_ValueTypeDef v;
+    YORUKV_StatusTypeDef status;
+
+    if (!out) return YORUKV_INVALID_PARAM;
+    status = YORUKV_Get(hkv, key, &v);
+    if (status != YORUKV_OK) return status;
+    if (v.Type != YORUKV_TYPE_U32) return YORUKV_TYPE_MISMATCH;
+    *out = (uint32_t)v.Value.U32;
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_GetStr(YORUKV_HandleTypeDef *hkv, const char *key, char *out, yorukv_u32_t out_size)
+{
+    YORUKV_ValueTypeDef v;
+    YORUKV_StatusTypeDef status;
+    yorukv_u32_t i;
+
+    if (!out || (out_size == 0u)) return YORUKV_INVALID_PARAM;
+    status = YORUKV_Get(hkv, key, &v);
+    if (status != YORUKV_OK) return status;
+    if (v.Type != YORUKV_TYPE_STRING) return YORUKV_TYPE_MISMATCH;
+    if (v.Value.String.Len + 1u > out_size) return YORUKV_NO_SPACE;
+
+    for (i = 0u; i < v.Value.String.Len; ++i) {
+        out[i] = v.Value.String.Ptr[i];
+    }
+    out[v.Value.String.Len] = '\0';
+    return YORUKV_OK;
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_ResetKey(YORUKV_HandleTypeDef *hkv, const char *key)
+{
+    return YORUKV_Reset(hkv, key);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_DeleteKey(YORUKV_HandleTypeDef *hkv, const char *key)
+{
+    return YORUKV_Delete(hkv, key);
+}
+
+static inline YORUKV_StatusTypeDef YORUKV_ListKeys(YORUKV_HandleTypeDef *hkv, YORUKV_ListCallbackTypeDef cb, void *user)
+{
+    return YORUKV_List(hkv, cb, user);
+}
+#endif
 
 #ifdef __cplusplus
 }
