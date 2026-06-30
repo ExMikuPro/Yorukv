@@ -4,11 +4,13 @@ Yorukv is a lightweight single-header KV helper for STM32-style embedded project
 
 Repository:
 
+* [ExMikuPro/Yorukv](https://github.com/ExMikuPro/Yorukv.git)
+
 ---
 
 > **Yoru Series**
 >
-> A family of lightweight utility libraries for STM32 HAL. Each library can be used independently or combined as needed.
+> Related lightweight utility libraries for STM32 HAL.
 >
 > | Library | Role |
 > | --- | --- |
